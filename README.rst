@@ -605,6 +605,82 @@ Sharing byte code is safe as it is read only and cannot be altered by lua script
     }
 
 +++++++++++++++++++++++++++++++++++++++++
+Sharing base libraries between LStates
++++++++++++++++++++++++++++++++++++++++++
+If you have multiple ``LStates`` which all have the same base libraries / environment, you can save a considerable
+amount of memory by sharing this data. In order to do this safely, a non-Lua standard concept of a read-only table has
+been introduced.
+
+First you must create a reference ``LState``, with all the globals and libraries preloaded that you want all your
+``LStates`` to have.
+
+.. code-block:: go
+    // this is where we will store the data to share
+    var sharedReg *lua.LTable
+    var sharedGlobals *lua.LTable
+
+    // PrepareSharedData will make the data we want to share with future LStates
+    func PrepareSharedData() {
+        // create lua state will full std lib
+        ls := lua.NewState()
+
+        // create custom global library with all our application specific bindings etc
+        myLib := ls.NewTable()
+
+        // ...add lots of functions and maybe subtables of functions to `myLib`...
+
+        // set globals. We set "lib" to be our tables of functions. Set other globals
+        // that you want to share here too.
+        ls.SetGlobal("lib", myLib)
+
+        // now we copy off the globals table and the registry table and mark the copies
+        // as read only so we can share them.
+        sharedGlobals = ls.NewTable()
+        sharedGlobals.RawSetString("__index", ls.Get(lua.GlobalsIndex))
+        sharedGlobals.SetReadOnlyRecursive()
+        sharedReg = ls.NewTable()
+        sharedReg.RawSetString("__index", ls.Get(lua.RegistryIndex))
+        sharedReg.SetReadOnlyRecursive()
+
+        // close our reference state
+        ls.Close()
+    }
+
+    // CreateSharingState will create a new LState which has the same libs and globals
+    // as our reference LState from PrepareSharedData(). The inherited values will be
+    // read only. The new state can of course still create its own globals etc as usual.
+    func CreateSharingState() *lua.LState {
+        // create our new state, skip the std lib opening as we will share those
+        ls := lua.NewState(lua.Options{SkipOpenLibs: true})
+
+        // set the globals table in the new state to fall through to our shared
+        // globals (read only) for missing values
+        ls.Get(lua.GlobalsIndex).(*lua.LTable).Metatable = sharedGlobals
+
+        // set the registry table to do the same. Replace the _LOADED key though,
+        // as that must be writable by our new state so that it can preload
+        // additional modules
+        stateRegistry := ls.Get(lua.RegistryIndex).(*lua.LTable)
+        stateRegistry.Metatable = sharedReg
+
+        // make the loaded table be writable so require will actually work
+        loadedTable := ls.NewTable()
+        loadedTable.Metatable = ls.GetField(stateRegistry, "_LOADED")
+        ls.SetField(stateRegistry, "_LOADED", loadedTable)
+
+        // return our new state
+        return ls
+    }
+
+This trick is a bit of a hack but can work very well for saving memory if you have a large amount of globals / libraries.
+It can also decrease the time to create new ``LStates`` if you do a lot of registration / setup for your states.
+
+You need to be careful if you write any additional table manipulation functions in Go that you pay attention to the read
+only flag on the table before writing to it. See the functions in `tablelib.go` for examples of how to do this.
+
+It is recommended that you profile to see if the read only tables benefit your use case before taking this patch.
+
++++++++++++++++++++++++++++++++++++++++++
 Goroutines
 +++++++++++++++++++++++++++++++++++++++++
 The ``LState`` is not goroutine-safe. It is recommended to use one LState per goroutine and communicate between goroutines by using channels.
